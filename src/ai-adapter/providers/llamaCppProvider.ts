@@ -1,5 +1,5 @@
 import { Provider } from "../provider";
-import { Notice, Setting } from "obsidian";
+import { Notice, Setting, requestUrl } from "obsidian";
 import { debugLog } from "../../util";
 import { Models } from "../types";
 import { notifyModelsChange, possibleModels } from "../globals";
@@ -14,6 +14,10 @@ export type LlamaCppSettings = {
 	url: string;
 	token: string;
 	temperature: number;
+	/** Modelnaam in de request-body. Leeg laten voor llama-server, dat één model
+	 * laadt en het veld negeert; OpenAI-compatible gateways (Bifrost, vLLM,
+	 * LiteLLM) eisen het juist. */
+	model: string;
 };
 
 // llama.cpp use local model
@@ -30,6 +34,7 @@ export const DEFAULT_LLAMA_CPP_SETTINGS: LlamaCppSettings = {
 	url: "http://127.0.0.1:8080",
 	token: "",
 	temperature: 0.7,
+	model: "",
 };
 
 function getLlamaCppSettings(): LlamaCppSettings {
@@ -43,7 +48,11 @@ function getLlamaCppSettings(): LlamaCppSettings {
 }
 
 export class LlamaCppProvider extends Provider {
-	private static currentController: AbortController | undefined;
+	/** requestUrl kent geen AbortSignal. Annuleren gebeurt daarom met een
+	 * generatieteller: het lopende verzoek loopt door, maar zodra de teller is
+	 * opgeschoven wordt het antwoord verworpen met een AbortError — dezelfde
+	 * semantiek als voorheen voor alles wat de caller ziet. */
+	private static generation = 0;
 
 	constructor() {
 		super();
@@ -108,6 +117,21 @@ export class LlamaCppProvider extends Provider {
 			);
 
 		new Setting(containerEl)
+			.setName("Model (optional)")
+			.setDesc(
+				"Model name sent in the request body. Leave empty for llama-server, which loads a single model. OpenAI-compatible gateways (Bifrost, vLLM, LiteLLM) require it, e.g. `gemma4:26b`.",
+			)
+			.addText((text) =>
+				text
+					.setPlaceholder("gemma4:26b")
+					.setValue(llamaCppSettings.model)
+					.onChange(async (value) => {
+						llamaCppSettings.model = value.trim();
+						await saveSettings(plugin);
+					}),
+			);
+
+		new Setting(containerEl)
 			.setName("Test connection")
 			.setDesc("Test the connection to llama-server")
 			.addButton((button) =>
@@ -158,29 +182,32 @@ export class LlamaCppProvider extends Provider {
 		}
 
 		LlamaCppProvider.abortCurrentRequest();
-		const controller = new AbortController();
-		LlamaCppProvider.currentController = controller;
+		const generation = ++LlamaCppProvider.generation;
 
 		try {
-			const response = await fetch(url, {
+			const response = await requestUrl({
+				url,
 				method: "POST",
 				headers,
 				body: JSON.stringify({
+					...(llamaCppSettings.model
+						? { model: llamaCppSettings.model }
+						: {}),
 					messages: [{ role: "user", content: prompt }],
 					temperature: llamaCppSettings.temperature,
 				}),
-				signal: controller.signal,
+				throw: false,
 			});
 
-			if (!response.ok) {
-				const errorText = await response.text();
+			LlamaCppProvider.throwIfSuperseded(generation);
+
+			if (response.status < 200 || response.status >= 300) {
 				throw new Error(
-					`HTTP error! status: ${response.status}, ${errorText}`,
+					`HTTP error! status: ${response.status}, ${response.text}`,
 				);
 			}
 
-			const data = await response.json();
-			return data.choices?.[0]?.message?.content || "";
+			return response.json?.choices?.[0]?.message?.content || "";
 		} catch (e) {
 			const errMsg =
 				e instanceof Error
@@ -198,8 +225,6 @@ export class LlamaCppProvider extends Provider {
 			const reErr = new Error(errMsg);
 			(reErr as unknown as { cause?: unknown }).cause = e;
 			throw reErr;
-		} finally {
-			LlamaCppProvider.currentController = undefined;
 		}
 	}
 
@@ -219,15 +244,18 @@ export class LlamaCppProvider extends Provider {
 		}
 
 		LlamaCppProvider.abortCurrentRequest();
-		const controller = new AbortController();
-		LlamaCppProvider.currentController = controller;
+		const generation = ++LlamaCppProvider.generation;
 
 		try {
 			// base64 picture
-			const response = await fetch(url, {
+			const response = await requestUrl({
+				url,
 				method: "POST",
 				headers,
 				body: JSON.stringify({
+					...(llamaCppSettings.model
+						? { model: llamaCppSettings.model }
+						: {}),
 					messages: [
 						{
 							role: "user",
@@ -244,18 +272,18 @@ export class LlamaCppProvider extends Provider {
 					],
 					temperature: llamaCppSettings.temperature,
 				}),
-				signal: controller.signal,
+				throw: false,
 			});
 
-			if (!response.ok) {
-				const errorText = await response.text();
+			LlamaCppProvider.throwIfSuperseded(generation);
+
+			if (response.status < 200 || response.status >= 300) {
 				throw new Error(
-					`HTTP error! status: ${response.status}, ${errorText}`,
+					`HTTP error! status: ${response.status}, ${response.text}`,
 				);
 			}
 
-			const data = await response.json();
-			return data.choices?.[0]?.message?.content || "";
+			return response.json?.choices?.[0]?.message?.content || "";
 		} catch (e) {
 			const errMsg =
 				e instanceof Error
@@ -273,8 +301,6 @@ export class LlamaCppProvider extends Provider {
 			const reErr = new Error(errMsg);
 			(reErr as unknown as { cause?: unknown }).cause = e;
 			throw reErr;
-		} finally {
-			LlamaCppProvider.currentController = undefined;
 		}
 	}
 
@@ -295,7 +321,6 @@ export class LlamaCppProvider extends Provider {
 
 	private async checkConnection(): Promise<boolean> {
 		const llamaCppSettings = getLlamaCppSettings();
-		const url = `${llamaCppSettings.url}/health`;
 		const token = llamaCppSettings.token;
 
 		const headers: Record<string, string> = {};
@@ -303,34 +328,49 @@ export class LlamaCppProvider extends Provider {
 			headers["Authorization"] = `Bearer ${token}`;
 		}
 
-		try {
-			const response = await fetch(url, { headers });
-			if (response.ok) {
-				debugLog(context, "Successfully connected to llama-server");
+		// llama-server antwoordt op /health; OpenAI-compatible gateways
+		// (Bifrost, vLLM, LiteLLM) kennen dat pad niet maar wel /v1/models.
+		for (const path of ["/health", "/v1/models"]) {
+			try {
+				const response = await requestUrl({
+					url: `${llamaCppSettings.url}${path}`,
+					headers,
+					throw: false,
+				});
+				if (response.status >= 200 && response.status < 300) {
+					debugLog(
+						context,
+						`Successfully connected via ${path}`,
+					);
 
-				// ensure model list include llama.cpp's model
-				if (!possibleModels.some((m) => m.provider === "llama-cpp")) {
-					possibleModels.push(LLAMA_CPP_MODEL);
-					notifyModelsChange();
+					// ensure model list include llama.cpp's model
+					if (
+						!possibleModels.some((m) => m.provider === "llama-cpp")
+					) {
+						possibleModels.push(LLAMA_CPP_MODEL);
+						notifyModelsChange();
+					}
+
+					return true;
 				}
-
-				return true;
+			} catch (e) {
+				debugLog(context, `Failed to connect via ${path}: ` + e);
 			}
-		} catch (e) {
-			debugLog(context, "Failed to connect to llama-server: " + e);
 		}
 		return false;
 	}
 
 	static abortCurrentRequest(): void {
-		if (LlamaCppProvider.currentController) {
-			try {
-				LlamaCppProvider.currentController.abort();
-			} catch {
-				// ignore
-			} finally {
-				LlamaCppProvider.currentController = undefined;
-			}
+		LlamaCppProvider.generation++;
+	}
+
+	/** Gooit een AbortError wanneer er intussen een nieuwer verzoek is gestart of
+	 * abortCurrentRequest() is aangeroepen. */
+	private static throwIfSuperseded(generation: number): void {
+		if (generation !== LlamaCppProvider.generation) {
+			const abortErr = new Error("Request was aborted");
+			abortErr.name = "AbortError";
+			throw abortErr;
 		}
 	}
 }
