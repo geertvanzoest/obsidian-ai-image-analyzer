@@ -1,5 +1,5 @@
 import { Provider } from "../provider";
-import { Notice, Setting, requestUrl } from "obsidian";
+import { Notice, Setting, debounce, requestUrl } from "obsidian";
 import { debugLog } from "../../util";
 import { Models } from "../types";
 import { notifyModelsChange, possibleModels } from "../globals";
@@ -61,6 +61,17 @@ export class LlamaCppProvider extends Provider {
 		this.lastImageModel = llamaCppSettings.lastImageModel;
 	}
 
+	/** Verbindingstest, uitgesteld tot 800 ms na de laatste wijziging. */
+	private debouncedCheckConnection = debounce(
+		() => {
+			void this.checkConnection().then((success) => {
+				debugLog(context, "llama.cpp check success: " + success);
+			});
+		},
+		800,
+		true,
+	);
+
 	async initialize(): Promise<boolean> {
 		const success = await this.checkConnection();
 		debugLog(context, "llama.cpp check success: " + success);
@@ -89,12 +100,11 @@ export class LlamaCppProvider extends Provider {
 							value = DEFAULT_LLAMA_CPP_SETTINGS.url;
 						}
 						llamaCppSettings.url = value;
-						this.checkConnection().then((success) => {
-							debugLog(
-								context,
-								"llama.cpp check success: " + success,
-							);
-						});
+						// Debounce: zonder dit vuurt er een verbindingstest per
+						// toetsaanslag, wat bij het intypen van een URL tientallen
+						// mislukte requests oplevert zolang de waarde nog
+						// onvolledig is.
+						this.debouncedCheckConnection();
 						await saveSettings(plugin);
 					}),
 			);
