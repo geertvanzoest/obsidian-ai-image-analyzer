@@ -8,6 +8,10 @@ import { saveSettings, settings } from "../../settings";
 
 const context = "ai-adapter/providers/llamaCppProvider";
 
+// Client-side output budget for both request paths: without it a derailing
+// generation holds a server slot until the 600s transport timeout.
+const MAX_OUTPUT_TOKENS = 4096;
+
 export type LlamaCppSettings = {
 	lastModel: Models;
 	lastImageModel: Models;
@@ -168,6 +172,7 @@ export class LlamaCppProvider extends Provider {
 				body: JSON.stringify({
 					messages: [{ role: "user", content: prompt }],
 					temperature: llamaCppSettings.temperature,
+					max_tokens: MAX_OUTPUT_TOKENS,
 				}),
 				signal: controller.signal,
 			});
@@ -243,6 +248,7 @@ export class LlamaCppProvider extends Provider {
 						},
 					],
 					temperature: llamaCppSettings.temperature,
+					max_tokens: MAX_OUTPUT_TOKENS,
 				}),
 				signal: controller.signal,
 			});
